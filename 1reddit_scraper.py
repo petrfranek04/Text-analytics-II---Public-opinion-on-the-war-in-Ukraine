@@ -2,15 +2,7 @@ import os
 import time
 import hashlib
 import requests
-import praw
 import pandas as pd
-
-# Connects to the official Reddit API via environment variables.
-reddit = praw.Reddit(
-    client_id=os.getenv("REDDIT_CLIENT_ID", "YOUR_CLIENT_ID"),
-    client_secret=os.getenv("REDDIT_CLIENT_SECRET", "YOUR_SECRET"),
-    user_agent="UkraineOpinionStudy/1.0 (Academic Research Project)"
-)
 
 # Configuration dictionary defining the five target war events and 28-day Unix UTC windows.
 EVENTS = {
@@ -21,100 +13,125 @@ EVENTS = {
     "5_carlson_aid": {"after": 1706745600, "before": 1709251200, "q": "Tucker|Carlson|aid|funding|Putin"}
 }
 
+# Target record quotas per subreddit for each event.
+SUBREDDIT_QUOTAS = {
+    "worldnews": 2000,
+    "europe": 1500,
+    "UkraineRussiaReport": 1500,
+    "Conservative": 500,
+    "politics": 500
+}
+
 def anonymize_user(author_obj):
     """
-    Converts a Reddit username into a deterministic 12-character SHA-256 hash
-    for privacy compliance while preserving author-level grouping.
+    Converts a Reddit username into a deterministic 12-character SHA-256 hash.
     """
     if not author_obj or str(author_obj) in ["[deleted]", "AutoModerator"]:
         return "deleted_or_bot"
     return hashlib.sha256(str(author_obj).encode("utf-8")).hexdigest()[:12]
 
-def fetch_historical_post_ids(subreddit, after_ts, before_ts, query, max_posts=150):
+def scrape_event_subreddit_paginated(subreddit, event_key, after_ts, before_ts, query, target_size):
     """
-    Queries the PullPush archive API to retrieve historical submission IDs
-    within the specified Unix timestamp boundaries.
+    Queries the Arctic Shift API in 100-record batches using server-side keyword
+    parameters and backward timestamp pagination ('before').
     """
-    url = "https://api.pullpush.io/reddit/search/submission/"
-    post_ids = []
+    headers = {"User-Agent": "UkraineOpinionStudy/1.0 (University Text Analytics Project)"}
+    primary_keyword = query.split("|")[0].strip()
+    records = []
 
-    while len(post_ids) < max_posts:
-        params = {
+    posts_url = "https://arctic-shift.photon-reddit.com/api/posts/search"
+    posts_params = {
+        "subreddit": subreddit,
+        "after": after_ts,
+        "before": before_ts,
+        "title": primary_keyword,
+        "limit": min(100, max(10, target_size // 10)),
+        "sort": "desc"
+    }
+    try:
+        resp_p = requests.get(posts_url, params=posts_params, headers=headers, timeout=20)
+        if resp_p.status_code == 200:
+            for p in resp_p.json().get("data", []):
+                records.append({
+                    "record_id": f"t3_{p.get('id')}",
+                    "parent_post_id": p.get("id"),
+                    "event": event_key,
+                    "subreddit": subreddit,
+                    "type": "post",
+                    "created_utc": int(p.get("created_utc", 0)),
+                    "author_hash": anonymize_user(p.get("author")),
+                    "text": f"{p.get('title', '')} {p.get('selftext', '')}".strip(),
+                    "score": p.get("score", 0),
+                    "upvote_ratio": p.get("upvote_ratio", None)
+                })
+    except Exception as e:
+        print(f"Error fetching posts ({subreddit}): {e}")
+
+    comments_url = "https://arctic-shift.photon-reddit.com/api/comments/search"
+    current_before = before_ts
+
+    while len(records) < target_size:
+        batch_limit = min(100, target_size - len(records))
+        comments_params = {
             "subreddit": subreddit,
             "after": after_ts,
-            "before": before_ts,
-            "q": query,
-            "sort_type": "score",
-            "sort": "desc",
-            "size": 100
+            "before": current_before,
+            "body": primary_keyword,
+            "limit": batch_limit,
+            "sort": "desc"
         }
         try:
-            resp = requests.get(url, params=params, timeout=15)
-            if resp.status_code != 200:
-                print(f"PullPush warning ({resp.status_code}), pausing...")
+            resp_c = requests.get(comments_url, params=comments_params, headers=headers, timeout=20)
+            if resp_c.status_code != 200:
+                print(f"Server returned status {resp_c.status_code}, waiting 3 seconds...")
                 time.sleep(3)
                 break
-            data = resp.json().get("data", [])
+
+            data = resp_c.json().get("data", [])
             if not data:
                 break
-            for item in data:
-                post_ids.append(item["id"])
-            break
-        except Exception as e:
-            print(f"Archive fetch error: {e}")
-            break
 
-    return list(set(post_ids))
-
-def collect_posts_and_comments(subreddit_name, event_key, post_ids, target_sample_size, comment_sort="top"):
-    """
-    Hydrates historical submission IDs via PRAW to extract post text
-    and up to 40 top-level or nested comments per thread.
-    """
-    records = []
-    for pid in post_ids:
-        if len(records) >= target_sample_size:
-            break
-        try:
-            submission = reddit.submission(id=pid)
-            submission.comment_sort = comment_sort
-            submission.comments.replace_more(limit=0)
-
-            records.append({
-                "record_id": f"t3_{submission.id}",
-                "parent_post_id": submission.id,
-                "event": event_key,
-                "subreddit": subreddit_name,
-                "type": "post",
-                "sort_mode": comment_sort,
-                "created_utc": int(submission.created_utc),
-                "author_hash": anonymize_user(submission.author),
-                "text": f"{submission.title} {submission.selftext}".strip(),
-                "score": submission.score,
-                "upvote_ratio": submission.upvote_ratio
-            })
-
-            for comment in submission.comments.list()[:40]:
-                if len(records) >= target_sample_size:
-                    break
-                if not hasattr(comment, "body"):
-                    continue
+            for c in data:
                 records.append({
-                    "record_id": f"t1_{comment.id}",
-                    "parent_post_id": submission.id,
+                    "record_id": f"t1_{c.get('id')}",
+                    "parent_post_id": str(c.get("link_id", "")).replace("t3_", ""),
                     "event": event_key,
-                    "subreddit": subreddit_name,
+                    "subreddit": subreddit,
                     "type": "comment",
-                    "sort_mode": comment_sort,
-                    "created_utc": int(comment.created_utc),
-                    "author_hash": anonymize_user(comment.author),
-                    "text": comment.body.strip(),
-                    "score": comment.score,
+                    "created_utc": int(c.get("created_utc", 0)),
+                    "author_hash": anonymize_user(c.get("author")),
+                    "text": str(c.get("body", "")).strip(),
+                    "score": c.get("score", 0),
                     "upvote_ratio": None
                 })
-            time.sleep(0.6)
+
+            oldest_timestamp = int(data[-1].get("created_utc", current_before))
+            current_before = (current_before - 1) if oldest_timestamp >= current_before else (oldest_timestamp - 1)
+            time.sleep(0.5)
+
         except Exception as e:
-            print(f"Failed on post {pid}: {e}")
-            continue
+            print(f"Error fetching comments ({subreddit}): {e}")
+            break
 
     return pd.DataFrame(records)
+
+if __name__ == "__main__":
+    os.makedirs("data/raw", exist_ok=True)
+    TEST_MODE = True
+    all_dataframes = []
+
+    for event_key, event_info in EVENTS.items():
+        for sub, full_quota in SUBREDDIT_QUOTAS.items():
+            target = 50 if TEST_MODE else full_quota
+            df_part = scrape_event_subreddit_paginated(
+                subreddit=sub,
+                event_key=event_key,
+                after_ts=event_info["after"],
+                before_ts=event_info["before"],
+                query=event_info["q"],
+                target_size=target
+            )
+            all_dataframes.append(df_part)
+
+        df_raw_all = pd.concat(all_dataframes, ignore_index=True)
+        df_raw_all.to_csv("data/raw/reddit_raw_checkpoint.csv", index=False)

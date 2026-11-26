@@ -1,51 +1,71 @@
-# ============================================================
-# BLOK 5: PŘEDPOVĚDI MODELŮ (VADER = baseline, RoBERTa = silnější model)
-# Co dělá: načte ručně označený vzorek (400 komentářů) a ke každému
-#   komentáři přidá předpověď sentimentu od dvou modelů:
-#     - VADER (slovníkový): compound skóre, práh ±0.05 -> 3 třídy
-#     - RoBERTa (cardiffnlp, trénovaná na sociálních sítích): 3 třídy
-#       + pravděpodobnosti a spojité skóre (pozitivní minus negativní)
-#   Modely hodnotí CELÝ text komentáře, ne sentiment vůči cíli
-#   (Ukrajina/Rusko). Právě v tom rozdílu budou chyby pro error analysis.
-# Vstup:  data/sample/gold_labels_v2.csv  (nahrajte na Drive předem)
-# Výstup: data/sample/gold_with_predictions.csv
-# Požadavky: zapnuté GPU (Runtime -> Change runtime type -> T4 GPU)
-#            a nainstalované balíčky (vaderSentiment, transformers).
-# ============================================================
-import pandas as pd
+"""
+Step 8: tone used as stance, with VADER (word list) and a RoBERTa sentiment model.
+positive -> pro, negative -> against, neutral -> neutral.
+A country whose keywords do not appear in the comment gets "na".
+"""
+import sys
+from pathlib import Path
+import re
+
 import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from transformers import pipeline
 
-BASE = "/content/drive/MyDrive/ukraine_project"
-gold = pd.read_csv(f"{BASE}/data/sample/gold_labels_v2.csv")
-texts = gold["text_sentiment"].tolist()
+sys.path.append(str(Path(__file__).resolve().parents[1]))  # folder with config.py and utils.py
+from config import RUS_PATTERN, SENTIMENT_MODEL, UKR_PATTERN
+from utils import load_pairs, prediction_file, save_predictions
 
-# --- VADER (baseline) ---
-vader = SentimentIntensityAnalyzer()
-gold["vader_compound"] = [vader.polarity_scores(t)["compound"] for t in texts]
-gold["vader_label"] = gold["vader_compound"].apply(
-    lambda c: "positive" if c >= 0.05 else ("negative" if c <= -0.05 else "neutral"))
+PATTERNS = {"russia": RUS_PATTERN, "ukraine": UKR_PATTERN}
+TONE_TO_STANCE = {"positive": "pro", "negative": "against", "neutral": "neutral"}
+BATCH = 16
 
-# --- RoBERTa (silnější model) ---
-clf = pipeline(
-    "sentiment-analysis",
-    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-    top_k=None,
-    device=0 if torch.cuda.is_available() else -1,
-)
-res = clf(texts, batch_size=32, truncation=True, max_length=512)
 
-for k in ["negative", "neutral", "positive"]:
-    gold[f"rob_{k}"] = [{d["label"].lower(): d["score"] for d in r}[k] for r in res]
+def vader_tones(texts):
+    vader = SentimentIntensityAnalyzer()
+    tones = {}
+    for text in texts:
+        score = vader.polarity_scores(text)["compound"]      # from -1 to +1
+        if score >= 0.05:
+            tones[text] = "positive"
+        elif score <= -0.05:
+            tones[text] = "negative"
+        else:
+            tones[text] = "neutral"
+    return tones
 
-cols = ["rob_negative", "rob_neutral", "rob_positive"]
-gold["roberta_label"] = gold[cols].idxmax(axis=1).str.replace("rob_", "")
-gold["roberta_score"] = gold["rob_positive"] - gold["rob_negative"]   # spojité skóre -1..+1
 
-gold.to_csv(f"{BASE}/data/sample/gold_with_predictions.csv", index=False)
+def roberta_tones(texts):
+    tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL).eval()
+    tones = {}
+    for start in range(0, len(texts), BATCH):
+        batch = texts[start:start + BATCH]
+        inputs = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+        with torch.no_grad():
+            best = model(**inputs).logits.argmax(dim=1)
+        for text, index in zip(batch, best.tolist()):
+            tones[text] = model.config.id2label[index].lower()
+    return tones
 
-# Rychlá kontrola, že vše proběhlo (zatím proti původnímu tónu)
-print("VADER   shoda s tone_label:", (gold.vader_label == gold.tone_label).mean().round(3))
-print("RoBERTa shoda s tone_label:", (gold.roberta_label == gold.tone_label).mean().round(3))
-print(gold[["vader_label", "roberta_label"]].apply(pd.Series.value_counts))
+
+def to_stance(pairs, tones):
+    stances = []
+    for row in pairs.itertuples():
+        mentioned = re.search(PATTERNS[row.country], row.text, re.IGNORECASE)
+        stances.append(TONE_TO_STANCE[tones[row.text]] if mentioned else "na")
+    return stances
+
+
+def main():
+    pairs = load_pairs()
+    pairs = pairs[pairs.split != "train"].reset_index(drop=True)
+    texts = list(pairs.text.unique())
+    for name, get_tones in [("vader", vader_tones), ("sentiment_roberta", roberta_tones)]:
+        if prediction_file(name).exists():
+            print(name, "already done, skipping")
+        else:
+            save_predictions(name, pairs, to_stance(pairs, get_tones(texts)))
+
+
+if __name__ == "__main__":
+    main()

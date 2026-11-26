@@ -1,94 +1,59 @@
-from google.colab import drive
-import pandas as pd
-import os
-
-drive.mount('/content/drive')
-BASE = "/content/drive/MyDrive/ukraine_project"
-os.makedirs(f"{BASE}/data/sample", exist_ok=True)
-
-SEED = 42
-N_PER_EVENT = 60        # 5 událostí x 60 = 300 náhodných komentářů
-N_HARD = 100            # komentáře s náznakem sarkasmu (jen pro error analysis)
-
-df = pd.read_csv(f"{BASE}/data/raw/reddit_cleaned_full_FINAL.csv").reset_index(drop=True)
-df["row_id"] = df.index          # stabilní ID, podle něj spojíme výsledky
-df = df.dropna(subset=["text_sentiment"])
-print("Celkem řádků:", len(df))
-print(df["event"].value_counts())
-
-# Kandidáti: 5-150 slov, ať jsou komentáře čitelné při anotaci (omezení -> do reportu)
-cand = df[(df["word_count"] >= 5) & (df["word_count"] <= 150)]
-
-# 1) Náhodný stratifikovaný vzorek podle události
-main = cand.groupby("event").sample(n=N_PER_EVENT, random_state=SEED).copy()
-main["sample_type"] = "random"
-
-# 2) Těžký vzorek: signály sarkasmu
-sarc_pattern = (r"(/s\b|yeah,? right|sure,? buddy|oh,? great|great job|totally|"
-                r"how (brave|original|surprising)|what a surprise|congrats|genius|"
-                r"thanks,? (obama|biden|trump)|so much for)")
-rest = cand[~cand["row_id"].isin(main["row_id"])]
-hard_pool = rest[rest["text_sentiment"].str.contains(sarc_pattern, case=False, regex=True)]
-print("Dostupných sarkastických kandidátů:", len(hard_pool))
-hard = hard_pool.sample(n=min(N_HARD, len(hard_pool)), random_state=SEED).copy()
-hard["sample_type"] = "sarcasm_hint"
-
-sample = pd.concat([main, hard]).sample(frac=1, random_state=SEED).reset_index(drop=True)
-
-# Plná verze s metadaty (zůstává na Drive)
-sample[["row_id", "event", "subreddit", "sample_type", "text_sentiment"]] \
-    .to_csv(f"{BASE}/data/sample/sample_full.csv", index=False)
-
-# Verze k anotaci: jen ID a text
-sample[["row_id", "text_sentiment"]].assign(gold_label="") \
-    .to_csv(f"{BASE}/data/sample/sample_to_label.csv", index=False)
-
-print("Vzorek:", sample["sample_type"].value_counts().to_dict())
-
-from google.colab import files
-files.download(f"{BASE}/data/sample/sample_to_label.csv")
-
-
-# ============================================================
-# BLOK 4: CÍLENÝ VZOREK (komentáře zmiňující Ukrajinu)
-# Co dělá: v náhodném vzorku bylo o Ukrajině jen 30 komentářů, což na
-#   metriky nestačí. Tento blok vybere dalších ~150 komentářů, které
-#   obsahují klíčová slova o Ukrajině (Ukrain*, Kyiv, Zelensky...),
-#   rovnoměrně z každé události, a vyloučí ty, které už ve vzorku jsou.
-# Vstup:  data/raw/reddit_cleaned_full_FINAL.csv, data/sample/sample_full.csv
-# Výstup: data/sample/sample_to_label_2.csv  (tento soubor pošlete Claudovi)
-#         data/sample/sample_targeted_full.csv (metadata, zůstává na Drive)
-# Pozor:  tento vzorek NENÍ náhodný, metriky z něj se uvádějí zvlášť
-#         a nesmí se použít k odhadu, jak často se o Ukrajině mluví.
-# ============================================================
+"""
+Step 1: draw the random sample of 1900 comments for annotation.
+- Candidates: comments with 5-150 words that mention Ukraine or Russia.
+- Each event x subreddit group gets the same share in the sample as among the candidates.
+- At most 20 comments from one thread.
+Output: data/sample/sample_events_full.csv      (with metadata)
+        data/sample/sample_events_to_label.csv  (texts only, for blind annotation)
+"""
+import sys
+from pathlib import Path
 import pandas as pd
 
-BASE = "/content/drive/MyDrive/ukraine_project"
-SEED = 42
-N_TARGETED = 150
+sys.path.append(str(Path(__file__).resolve().parents[1]))  # folder with config.py and utils.py
+from config import CLEAN_FILE, RUS_PATTERN, SAMPLE, SEED, UKR_PATTERN
+from utils import proportional_quotas, save_new
 
-df = pd.read_csv(f"{BASE}/data/raw/reddit_cleaned_full_FINAL.csv").reset_index(drop=True)
-df["row_id"] = df.index
-df = df.dropna(subset=["text_sentiment"])
+SAMPLE_SIZE = 1900
+MAX_PER_THREAD = 20
+GROUPS = ["event", "sub_group"]
 
-already = pd.read_csv(f"{BASE}/data/sample/sample_full.csv")["row_id"]
-cand = df[(df["word_count"].between(5, 150)) & (~df["row_id"].isin(already))]
 
-ua_pattern = r"(ukrain|kyiv|kiev|zelensk|kharkiv|kherson|donbas|mariupol|bakhmut|azov)"
-pool = cand[cand["text_sentiment"].str.contains(ua_pattern, case=False, regex=True)]
-print("Kandidátů zmiňujících Ukrajinu:", len(pool))
+def load_candidates():
+    data = pd.read_csv(CLEAN_FILE)
+    data["row_id"] = data.index      # stable ID: the row number in the cleaned file
+    data = data.dropna(subset=["text_sentiment"])
+    data = data[(data["type"] == "comment") & data["word_count"].between(5, 150)]
+    mentions = data["text_sentiment"].str.contains(f"{UKR_PATTERN}|{RUS_PATTERN}", case=False)
+    data = data[mentions].copy()
+    # The two US political subreddits are small, so they form one group
+    data["sub_group"] = data["subreddit"].replace({"politics": "US", "Conservative": "US"})
+    return data
 
-per_event = N_TARGETED // pool["event"].nunique()
-targeted = pool.groupby("event").sample(n=per_event, random_state=SEED)
-targeted = targeted.sample(frac=1, random_state=SEED).reset_index(drop=True)
 
-targeted.assign(sample_type="targeted_ua")[
-    ["row_id", "event", "subreddit", "sample_type", "text_sentiment"]
-].to_csv(f"{BASE}/data/sample/sample_targeted_full.csv", index=False)
+def draw_sample(candidates):
+    quotas = proportional_quotas(candidates.groupby(GROUPS).size(), SAMPLE_SIZE)
+    # Shuffle, then keep only the first 20 comments of every thread
+    shuffled = candidates.sample(frac=1, random_state=SEED)
+    capped = shuffled.groupby(GROUPS + ["parent_post_id"]).head(MAX_PER_THREAD)
+    parts = []
+    for group, rows in capped.groupby(GROUPS):
+        parts.append(rows.sample(n=min(quotas[group], len(rows)), random_state=SEED))
+    # Shuffle again, so the annotator does not see one event after another
+    return pd.concat(parts).sample(frac=1, random_state=SEED).reset_index(drop=True)
 
-targeted[["row_id", "text_sentiment"]].to_csv(
-    f"{BASE}/data/sample/sample_to_label_2.csv", index=False)
 
-from google.colab import files
-files.download(f"{BASE}/data/sample/sample_to_label_2.csv")
-print("Vzorek:", len(targeted))
+def main():
+    if (SAMPLE / "sample_events_full.csv").exists():
+        print("The sample already exists, nothing to do.")
+        return
+    sample = draw_sample(load_candidates())
+    columns = ["row_id", "event", "subreddit", "sub_group", "parent_post_id", "text_sentiment"]
+    save_new(sample[columns], SAMPLE / "sample_events_full.csv")
+    to_label = sample[["row_id", "text_sentiment"]].assign(stance_russia="", stance_ukraine="", uncertain="")
+    save_new(to_label, SAMPLE / "sample_events_to_label.csv")
+    print(pd.crosstab(sample["event"], sample["sub_group"], margins=True))
+
+
+if __name__ == "__main__":
+    main()

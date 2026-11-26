@@ -1,71 +1,76 @@
+"""
+Preparation step 2: clean the raw data.
+Output: data/reddit_cleaned_full.csv
+        data/sample/sample_anonymized.csv (100 rows without the raw text)
+If the cleaned file exists, nothing happens: a row's number is its ID in the labels.
+Known limits: "I'm a bot" and "[removed]" inside a longer text are not caught.
+"""
+import sys
+from pathlib import Path
 import re
 
-def clean_scraped_data(df):
-    """
-    Vyčistí surová data z Redditu a zaznamená, kolik řádků vypadlo v každém kroku.
-    Vytvoří dva textové sloupce:
-      - 'text_sentiment': ponechá interpunkci (!!!) a velká písmena pro VADER a RoBERTa.
-      - 'text_topic': odstraní markdown a odkazy pro čisté shlukování v BERTopic.
-    """
-    # Slovník pro sledování počtu záznamů v jednotlivých fázích čištění (do reportu)
-    stats = {"1_Hruba_data_celkem": len(df)}
+import pandas as pd
 
-    # 1. Odstranění duplicitních ID (pokud se stejný příspěvek stáhl vícekrát)
-    df = df.drop_duplicates(subset=["record_id"], keep="first").copy()
-    stats["2_Po_odstraneni_duplicitnich_ID"] = len(df)
+sys.path.append(str(Path(__file__).resolve().parents[1]))  # folder with config.py and utils.py
+from config import CLEAN_FILE, RAW_FILE, SAMPLE, SEED
+from utils import save_new
 
-    # 2. Odstranění smazaných komentářů ([deleted], [removed]) a automatických botů
-    df = df[~df["author_hash"].isin(["deleted_or_bot"])]
-    df = df[~df["text"].isin(["[removed]", "[deleted]", ""])]
+BOT_PHRASES = r"I am a bot|performed automatically|RemindMe!|submission statement"
 
-    # Odfiltrujeme typické hlášky moderátorských botů v textu
-    bot_patterns = r"I am a bot|performed automatically|RemindMe!|submission statement"
-    df = df[~df["text"].str.contains(bot_patterns, case=False, na=False)]
-    stats["3_Po_odstraneni_botu_a_smazanych"] = len(df)
 
-    # 3. Odstranění citací (řádky začínající '>') a URL odkazů.
-    # DŮLEŽITÉ: Na Redditu lidé citují názor oponenta pomocí '>' a pak s ním nesouhlasí.
-    # Kdybychom citaci nechali, model sentimentu by hodnotil slova oponenta!
-    def clean_for_sentiment(text):
-        text = re.sub(r"(?m)^>.*$", "", str(text))        # Smaže citované řádky
-        text = re.sub(r"http\S+|www\.\S+", "", text)      # Smaže webové odkazy
-        return re.sub(r"\s+", " ", text).strip()          # Sjednotí mezery
+def clean_for_sentiment(text):
+    """Keeps punctuation and capital letters, because sentiment models use them."""
+    # Lines starting with ">" quote someone else, often an opinion the author rejects
+    text = re.sub(r"(?m)^>.*$", "", str(text))
+    text = re.sub(r"http\S+|www\.\S+", "", text)           # web links
+    return re.sub(r"\s+", " ", text).strip()               # extra spaces
 
-    df["text_sentiment"] = df["text"].apply(clean_for_sentiment)
 
-    # 4. Silnější čištění pro BERTopic (odstraní odkazy na subreddity r/..., uživatele u/... a hvězdičky)
-    def clean_for_bertopic(text):
-        text = re.sub(r"/?[ru]/[A-Za-z0-9_-]+", "", text)
-        text = re.sub(r"[\*\[\]\(\)~_`#]", " ", text)
-        return re.sub(r"\s+", " ", text).strip()
+def clean_for_topics(text):
+    """Also removes subreddit and user names and formatting characters."""
+    text = re.sub(r"/?[ru]/[A-Za-z0-9_-]+", "", text)
+    text = re.sub(r"[\*\[\]\(\)~_`#]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
-    df["text_topic"] = df["text_sentiment"].apply(clean_for_bertopic)
 
-    # 5. Odstranění spamu (identické texty kopírované do více vláken)
-    df = df.drop_duplicates(subset=["text_sentiment"], keep="first")
-    stats["4_Po_odstraneni_spamu"] = len(df)
+def clean(data):
+    """Returns the cleaned data and the number of rows after every step."""
+    counts = {"raw records": len(data)}
 
-    # 6. Odstranění příliš krátkých výkřiků (méně než 5 slov, např. "Agreed!", "This.")
-    df["word_count"] = df["text_sentiment"].apply(lambda x: len(x.split()))
-    df = df[df["word_count"] >= 5].copy()
-    stats["5_Finalni_cista_data"] = len(df)
+    data = data.drop_duplicates(subset=["record_id"])
+    counts["without duplicate IDs"] = len(data)
 
-    return df, pd.Series(stats, name="Pocet_zaznamu")
+    data = data[data["author_hash"] != "deleted_or_bot"]
+    data = data[~data["text"].isin(["[removed]", "[deleted]", ""])]
+    data = data[~data["text"].str.contains(BOT_PHRASES, case=False, na=False)].copy()
+    counts["without deleted and bot messages"] = len(data)
 
-# Spustíme čištění na stažených datech
-df_clean, funnel_table = clean_scraped_data(df_raw_all)
+    data["text_sentiment"] = data["text"].apply(clean_for_sentiment)
+    data["text_topic"] = data["text_sentiment"].apply(clean_for_topics)
 
-print("=== PŘEHLED ČIŠTĚNÍ DAT (Uložte si do report.pdf!) ===")
-display(funnel_table.to_frame())
+    data = data.drop_duplicates(subset=["text_sentiment"]).copy()      # copied spam
+    counts["without repeated texts"] = len(data)
 
-# Uložíme kompletní čistý dataset pro vaše kolegy v týmu (pro modely VADER, RoBERTa, BERTopic)
-df_clean.to_csv("data/raw/reddit_cleaned_full.csv", index=False)
+    data["word_count"] = data["text_sentiment"].apply(lambda text: len(text.split()))
+    data = data[data["word_count"] >= 5]                               # e.g. "Agreed!"
+    counts["with at least 5 words"] = len(data)
+    return data, counts
 
-# Uložíme malý anonymizovaný vzorek (100 řádků) bez surového textu, který smíte nahrát na GitHub
-os.makedirs("data/sample", exist_ok=True)
-df_sample = df_clean.drop(columns=["text"]).sample(n=min(100, len(df_clean)), random_state=42)
-df_sample.to_csv("data/sample/sample_anonymized.csv", index=False)
 
-print(f"\nČistý dataset uložen do 'data/raw/reddit_cleaned_full.csv' ({len(df_clean)} řádků).")
-print("Anonymizovaný vzorek (100 řádků) pro GitHub uložen do 'data/sample/sample_anonymized.csv'.")
-display(df_clean[["event", "subreddit", "type", "word_count", "text_sentiment"]].head(10))
+def main():
+    if CLEAN_FILE.exists():
+        print("The cleaned data already exists, nothing to do.")
+        return
+    # keep_default_na=False: an empty text stays "" and is not turned into a missing value
+    raw = pd.read_csv(RAW_FILE, keep_default_na=False,
+                      dtype={"parent_post_id": str, "author_hash": str, "text": str})
+    cleaned, counts = clean(raw)
+    for step, number in counts.items():
+        print(f"{step:35s} {number}")
+    save_new(cleaned, CLEAN_FILE)
+    example = cleaned.drop(columns=["text"]).sample(n=min(100, len(cleaned)), random_state=SEED)
+    save_new(example, SAMPLE / "sample_anonymized.csv")
+
+
+if __name__ == "__main__":
+    main()
